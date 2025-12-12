@@ -42,7 +42,7 @@ class LLMResult:
 
 @app.get("/ping")
 def ping():
-    return {"status": "ok",    "clientID": GOOGLE_CLIENT_ID}
+    return {"status": "ok"}
 
 if GOOGLE_CLIENT_ID:
     db = firestore.Client()
