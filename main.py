@@ -88,6 +88,7 @@ def get_or_create_user(user: AuthenticatedUser):
             doc_ref.set(existing)
         return existing
 
+    # user not existing, creating in PENDING state for approval 
     user_record = {
         "createdAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -469,3 +470,14 @@ def generate(
     check_usage(user.user_id, cost=actual_cost, actual=True)
 
     return GenerateResponse(result=llm_result.text)
+
+
+@app.get("/api/auth/status")
+def auth_status(user: AuthenticatedUser = Depends(verify_id_token_and_get_user)):
+    """
+    Lightweight status check invoked right after login so the client can fail fast
+    (e.g., pending approval or refused access) instead of discovering it during messaging.
+    """
+    user_doc = get_or_create_user(user)
+    ensure_user_is_active(user_doc)
+    return {"status": "active"}
