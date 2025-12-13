@@ -40,6 +40,23 @@ class LLMResult:
     input_tokens: int | None
     output_tokens: int | None
 
+
+@dataclass
+class AuthenticatedUser:
+    user_id: str
+    email: str | None = None
+
+
+class UserStatus:
+    PENDING = "pending"
+    ACTIVE = "active"
+    REFUSED = "refused"
+
+
+class AccessErrorCode:
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    ACCESS_REFUSED = "ACCESS_REFUSED"
+
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
@@ -52,19 +69,60 @@ else:
 MONTHLY_USD_LIMIT = 3.00  # for example
 RESET_DAYS = 30
 
-def get_or_create_user(user_id: str):
-    doc_ref = db.collection("users").document(user_id)
+def _require_db():
+    if db is None:
+        logger.error("Firestore client unavailable")
+        raise HTTPException(status_code=500, detail="Database unavailable")
+    return db
+
+
+def get_or_create_user(user: AuthenticatedUser):
+    active_db = _require_db()
+    doc_ref = active_db.collection("users").document(user.user_id)
     doc = doc_ref.get()
     if doc.exists:
-        return doc.to_dict()
-    doc_ref.set({
+        existing = doc.to_dict() or {}
+        if user.email and existing.get("email") != user.email:
+            existing["email"] = user.email
+            existing["updatedAt"] = firestore.SERVER_TIMESTAMP
+            doc_ref.set(existing)
+        return existing
+
+    user_record = {
         "createdAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
-    })
-    return None
+        "status": UserStatus.PENDING,
+        "email": user.email,
+    }
+    doc_ref.set(user_record)
+    return user_record
+
+
+def ensure_user_is_active(user_doc: dict | None):
+    status = (user_doc or {}).get("status") or UserStatus.PENDING
+    if status == UserStatus.PENDING:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": AccessErrorCode.PENDING_APPROVAL,
+                "message": "User pending approval",
+            },
+        )
+    if status == UserStatus.REFUSED:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": AccessErrorCode.ACCESS_REFUSED,
+                "message": "User access refused",
+            },
+        )
+    if status != UserStatus.ACTIVE:
+        logger.error("Unknown user status: %s", status)
+        raise HTTPException(status_code=403, detail="User status invalid")
 
 def ensure_active_subscription(user_id: str):
-    sub_ref = db.collection("subscriptions").document(user_id)
+    active_db = _require_db()
+    sub_ref = active_db.collection("subscriptions").document(user_id)
     sub_doc = sub_ref.get()
     if not sub_doc.exists or not sub_doc.to_dict().get("createdAt"):
         raise HTTPException(status_code=402, detail=f"Subscription for {user_id} never created")
@@ -228,7 +286,7 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
 
 def verify_id_token_and_get_user(
     authorization: str = Header(None),
-) -> str:
+) -> AuthenticatedUser:
     """
     Extracts the Bearer token, verifies it with Google,
     and returns the google ID.
@@ -250,8 +308,9 @@ def verify_id_token_and_get_user(
 
     # 'sub' is the stable user identifier
     user_sub = idinfo["sub"]
+    user_email = idinfo.get("email")
     logger.info(f"Authenticated user sub={user_sub}")
-    return user_sub
+    return AuthenticatedUser(user_id=user_sub, email=user_email)
 
 def estimate_tokens(prompt: str) -> int:
     return len(prompt.split()) * 2
@@ -372,14 +431,17 @@ llm_generate = call_vertex_gemini
 @app.post("/api/generate", response_model=GenerateResponse)
 def generate(
     req: GenerateRequest,
-    user_id: str = Depends(verify_id_token_and_get_user),  # custom type
+    user: AuthenticatedUser = Depends(verify_id_token_and_get_user),  # custom type
 ):
 
     # Ensure user document exists
-    get_or_create_user(user_id)
+    user_doc = get_or_create_user(user)
+
+    # Ensure user is approved
+    ensure_user_is_active(user_doc)
 
     # Ensure subscription is active
-    ensure_active_subscription(user_id)
+    ensure_active_subscription(user.user_id)
 
     # Build contents payload (prefer provided structured history)
     contents = req.contents or []
@@ -395,7 +457,7 @@ def generate(
     est_cost = calculate_cost(req.model, estimate_tokens_in, estimate_tokens_out)
 
     # Pre-check quota
-    check_usage(user_id, cost=est_cost, actual=False)
+    check_usage(user.user_id, cost=est_cost, actual=False)
 
     # Call Gemini (real)
     llm_result = llm_generate(contents, req.model)
@@ -404,6 +466,6 @@ def generate(
     actual_cost = calculate_cost(req.model, input_tokens, output_tokens)
 
     # Commit real cost
-    check_usage(user_id, cost=actual_cost, actual=True)
+    check_usage(user.user_id, cost=actual_cost, actual=True)
 
     return GenerateResponse(result=llm_result.text)

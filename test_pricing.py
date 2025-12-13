@@ -263,7 +263,14 @@ class GenerateEndpointTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime.now(timezone.utc)
         self.user_id = "test-user"
-        self.users_store = {}
+        self.users_store = {
+            self.user_id: {
+                "createdAt": self.now,
+                "updatedAt": self.now,
+                "status": "active",
+                "email": "tester@example.com",
+            }
+        }
         self.subscriptions_store = {
             self.user_id: {
                 "createdAt": self.now,
@@ -304,10 +311,13 @@ class GenerateEndpointTests(unittest.TestCase):
         self.stub_llm = StubLLM()
         main.llm_generate = self.stub_llm
         self.req = main.GenerateRequest(prompt="Hello world", model="default")
+        self.user_ctx = main.AuthenticatedUser(
+            user_id=self.user_id, email="tester@example.com"
+        )
         self.main = main
 
     def test_generate_uses_llm_tokens_and_updates_usage(self):
-        response = self.main.generate(self.req, user_id=self.user_id)
+        response = self.main.generate(self.req, user=self.user_ctx)
 
         expected_cost = self.main.calculate_cost(
             "default", input_tokens=1200, output_tokens=800
@@ -337,7 +347,7 @@ class GenerateEndpointTests(unittest.TestCase):
         null_llm = NullUsageLLM()
         self.main.llm_generate = null_llm
 
-        response = self.main.generate(self.req, user_id=self.user_id)
+        response = self.main.generate(self.req, user=self.user_ctx)
 
         expected_input = self.main.estimate_tokens("Hello world")
         expected_output = self.main.estimate_tokens("Short")
@@ -381,7 +391,7 @@ class GenerateEndpointTests(unittest.TestCase):
             contents=provided_contents,
         )
 
-        response = self.main.generate(req, user_id=self.user_id)
+        response = self.main.generate(req, user=self.user_ctx)
 
         self.assertEqual(response.result, "Done")
         self.assertEqual(len(capturing_llm.calls), 1)
@@ -389,6 +399,75 @@ class GenerateEndpointTests(unittest.TestCase):
         self.assertEqual(contents, provided_contents)
         self.assertEqual(model, "default")
 
+
+class UserAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime.now(timezone.utc)
+        self.users_store = {}
+        self.subscriptions_store = {}
+        self.usage_store = {}
+
+        import main
+
+        self.main = main
+        self.db = FullStubDB(
+            usage_store=self.usage_store,
+            users_store=self.users_store,
+            subscriptions_store=self.subscriptions_store,
+        )
+        self.main.db = self.db
+
+        class CapturingLLM:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, contents, model):
+                self.calls.append((contents, model))
+                return self.main.LLMResult(text="ok", input_tokens=10, output_tokens=5)
+
+        self.capturing_llm = CapturingLLM()
+        self.main.llm_generate = self.capturing_llm
+
+    def test_new_user_is_created_pending_and_returns_pending_error(self):
+        user_ctx = self.main.AuthenticatedUser(
+            user_id="new-user", email="newuser@example.com"
+        )
+        req = self.main.GenerateRequest(prompt="hi", model="default")
+
+        with self.assertRaises(self.main.HTTPException) as ctx:
+            self.main.generate(req, user=user_ctx)
+
+        exc = ctx.exception
+        self.assertEqual(exc.status_code, 403)
+        self.assertEqual(
+            exc.detail.get("code"), self.main.AccessErrorCode.PENDING_APPROVAL
+        )
+        saved_user = self.users_store["new-user"]
+        self.assertEqual(saved_user["status"], self.main.UserStatus.PENDING)
+        self.assertEqual(saved_user["email"], "newuser@example.com")
+        self.assertEqual(len(self.capturing_llm.calls), 0)
+
+    def test_refused_user_is_blocked(self):
+        self.users_store["blocked-user"] = {
+            "createdAt": self.now,
+            "updatedAt": self.now,
+            "status": "refused",
+            "email": "blocked@example.com",
+        }
+        user_ctx = self.main.AuthenticatedUser(
+            user_id="blocked-user", email="blocked@example.com"
+        )
+        req = self.main.GenerateRequest(prompt="hi", model="default")
+
+        with self.assertRaises(self.main.HTTPException) as ctx:
+            self.main.generate(req, user=user_ctx)
+
+        exc = ctx.exception
+        self.assertEqual(exc.status_code, 403)
+        self.assertEqual(
+            exc.detail.get("code"), self.main.AccessErrorCode.ACCESS_REFUSED
+        )
+        self.assertEqual(len(self.capturing_llm.calls), 0)
 
 if __name__ == "__main__":
     unittest.main()
