@@ -19,8 +19,13 @@ class GenerateRequest(BaseModel):
     # Structured contents (list of Vertex-style messages: role + parts[{text}])
     contents: list[dict] = []
 
+class FunctionCall(BaseModel):
+    name: str
+    args: dict
+
 class GenerateResponse(BaseModel):
     result: str
+    function_calls: list[FunctionCall] = []
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
@@ -33,12 +38,49 @@ logger = logging.getLogger(__name__)
 VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "europe-west1")
 AI_TIMEOUT_SECONDS = int(os.environ.get("AI_TIMEOUT_SECONDS", "30"))
 
-
-@dataclass
-class LLMResult:
-    text: str
-    input_tokens: int | None
-    output_tokens: int | None
+# Function declarations for function calling - defined as constants in the backend
+FUNCTION_DECLARATIONS = [
+    {
+        "functionDeclarations": [
+            {
+                "name": "allow",
+                "description": "Grants additional time to the user. Use this when the user requests a break, acknowledges they need time, or when you want to give them extra time. If the user mentions a duration (e.g., 'back in 15 minutes'), use that duration. If no duration is given, choose a reasonable default (e.g., 10-20 minutes based on the activity).",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "minutes": {
+                            "type": "INTEGER",
+                            "description": "The number of minutes to grant. Must be a positive integer."
+                        },
+                        "app": {
+                            "type": "STRING",
+                            "description": "Optional. The name of the specific app to allow time for. If not provided, the allowance applies to all apps."
+                        }
+                    },
+                    "required": ["minutes"]
+                }
+            },
+            {
+                "name": "remember",
+                "description": "Stores information in the AI's memory so it can be recalled in future conversations. Use this to save important facts, preferences, or context that should persist across conversations. If minutes is provided, the memory will expire after that duration. If minutes is omitted, the memory is permanent.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "content": {
+                            "type": "STRING",
+                            "description": "The information to remember. Should be a clear, concise fact or piece of context."
+                        },
+                        "minutes": {
+                            "type": "INTEGER",
+                            "description": "Optional. The number of minutes after which this memory should expire. If omitted, the memory is permanent."
+                        }
+                    },
+                    "required": ["content"]
+                }
+            }
+        ]
+    }
+]
 
 
 @dataclass
@@ -387,7 +429,29 @@ def _build_model_path(model: str, project_id: str, location: str) -> str:
     return f"projects/{project_id}/locations/{location}/publishers/google/models/{model}"
 
 
-def call_vertex_gemini(contents: list[dict], model: str) -> LLMResult:
+def _extract_function_calls(payload: dict) -> list[FunctionCall]:
+    """Extract function calls from Vertex AI response."""
+    function_calls = []
+    candidates = payload.get("candidates") or []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content", {})
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts", [])
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            function_call = part.get("functionCall")
+            if function_call and isinstance(function_call, dict):
+                name = function_call.get("name")
+                args = function_call.get("args", {})
+                if name:
+                    function_calls.append(FunctionCall(name=name, args=args))
+    return function_calls
+
+def call_vertex_gemini(contents: list[dict], model: str) -> tuple[str, list[FunctionCall]]:
     try:
         credentials, project_id = google.auth.default(
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
@@ -405,7 +469,10 @@ def call_vertex_gemini(contents: list[dict], model: str) -> LLMResult:
     url = f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1/{model_path}:generateContent"
 
     session = google.auth.transport.requests.AuthorizedSession(credentials)
-    payload = {"contents": contents}
+    payload = {
+        "contents": contents,
+        "tools": FUNCTION_DECLARATIONS  # Always include function declarations
+    }
     response = session.post(url, json=payload, timeout=AI_TIMEOUT_SECONDS)
 
     if response.status_code >= 300:
@@ -420,10 +487,11 @@ def call_vertex_gemini(contents: list[dict], model: str) -> LLMResult:
         logger.error("Failed to parse AI response JSON: %s", exc)
         raise HTTPException(status_code=502, detail="AI response invalid")
     text = _extract_text_from_response(data)
+    function_calls = _extract_function_calls(data)
     usage_meta = data.get("usageMetadata") or {}
     input_tokens, output_tokens = _extract_usage_tokens(usage_meta)
 
-    return LLMResult(text=text, input_tokens=input_tokens, output_tokens=output_tokens)
+    return (text, function_calls)
 
 
 # Default LLM generator can be overridden in tests
