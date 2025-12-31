@@ -553,7 +553,7 @@ def _extract_function_calls(payload: dict) -> list[FunctionCall]:
                     function_calls.append(FunctionCall(name=name, args=args))
     return function_calls
 
-def call_vertex_gemini(contents: list[dict], model: str) -> tuple[str, list[FunctionCall]]:
+def call_vertex_gemini(contents: list[dict], model: str) -> tuple[str | None, list[FunctionCall], int | None, int | None]:
     try:
         credentials, project_id = google.auth.default(
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
@@ -593,7 +593,7 @@ def call_vertex_gemini(contents: list[dict], model: str) -> tuple[str, list[Func
     usage_meta = data.get("usageMetadata") or {}
     input_tokens, output_tokens = _extract_usage_tokens(usage_meta)
 
-    return (text, function_calls)
+    return (text, function_calls, input_tokens, output_tokens)
 
 
 # Default LLM generator can be overridden in tests
@@ -631,9 +631,11 @@ def generate(
     check_usage(user.user_id, cost=est_cost, actual=False)
 
     # Call Gemini (real)
-    text, function_calls = llm_generate(contents, req.model)
-    input_tokens = estimate_tokens_in  # We'd need to extract from response if available
-    output_tokens = estimate_tokens(text)
+    text, function_calls, actual_input_tokens, actual_output_tokens = llm_generate(contents, req.model)
+    
+    # Always use actual token counts from API response when available, fallback to estimates only if API didn't provide them
+    input_tokens = actual_input_tokens if actual_input_tokens is not None else estimate_tokens_in
+    output_tokens = actual_output_tokens if actual_output_tokens is not None else (estimate_tokens(text) if text else 0)
     actual_cost = calculate_cost(req.model, input_tokens, output_tokens)
 
     # Commit real cost
