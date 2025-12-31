@@ -25,7 +25,7 @@ class FunctionCall(BaseModel):
     args: dict
 
 class GenerateResponse(BaseModel):
-    result: str
+    result: str | None = None  # None when response only contains function calls, no text
     function_calls: list[FunctionCall] = []
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -483,12 +483,19 @@ def _estimate_tokens_in(contents: list[dict]) -> int:
     return result
 
 
-def _extract_text_from_response(payload: dict) -> str:
+def _extract_text_from_response(payload: dict) -> str | None:
+    """
+    Extracts text from the AI response. Returns None if response only contains
+    function calls (which is valid - the AI can respond with just function calls).
+    Returns None to distinguish "missing text" from "empty text".
+    """
     candidates = payload.get("candidates") or []
     if candidates:
         first_candidate = candidates[0] or {}
         content = first_candidate.get("content", {}) if isinstance(first_candidate, dict) else {}
         parts = content.get("parts") or []
+        
+        # Check for text parts
         text_parts = [
             part.get("text")
             for part in parts
@@ -496,12 +503,26 @@ def _extract_text_from_response(payload: dict) -> str:
         ]
         if text_parts:
             return "".join(text_parts)
+        
+        # Check for outputText field
         if isinstance(first_candidate.get("outputText"), str):
             return first_candidate["outputText"]
+        
+        # Check if response has function calls but no text (this is valid)
+        has_function_calls = any(
+            isinstance(part, dict) and part.get("functionCall")
+            for part in parts
+        )
+        if has_function_calls:
+            # Valid response with only function calls, return None (missing, not empty)
+            return None
+    
     if isinstance(payload.get("text"), str):
         return payload["text"]
-    logger.error("AI response missing text: %s", payload)
-    raise HTTPException(status_code=502, detail="AI response missing text")
+    
+    # If we get here, there's no text and no function calls - this is an error
+    logger.error("AI response missing both text and function calls: %s", payload)
+    raise HTTPException(status_code=502, detail="AI response missing text and function calls")
 
 
 def _build_model_path(model: str, project_id: str, location: str) -> str:
