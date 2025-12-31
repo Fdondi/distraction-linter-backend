@@ -6,6 +6,7 @@ from google.cloud import firestore
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
+import secrets
 
 import google.auth
 import google.auth.transport.requests
@@ -110,6 +111,7 @@ else:
 
 MONTHLY_USD_LIMIT = 3.00  # for example
 RESET_DAYS = 30
+APP_TOKEN_VALIDITY_DAYS = 30
 
 def _require_db():
     if db is None:
@@ -327,12 +329,85 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     )
     return input_cost + output_cost
 
+def _parse_expires_at(expires_at) -> datetime | None:
+    """
+    Helper to parse expiration timestamp from various Firestore formats.
+    Returns None if parsing fails or value is invalid.
+    """
+    if not expires_at:
+        return None
+    
+    if isinstance(expires_at, datetime):
+        return expires_at
+    elif hasattr(expires_at, 'timestamp'):
+        # Firestore Timestamp object
+        return datetime.fromtimestamp(expires_at.timestamp(), tz=timezone.utc)
+    elif isinstance(expires_at, str):
+        # ISO string format
+        try:
+            return datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+        except Exception:
+            return None
+    return None
+
+
+def verify_app_token(token: str) -> AuthenticatedUser | None:
+    """
+    Verifies an app token from Firestore and returns the authenticated user.
+    Returns None if token is invalid or expired.
+    
+    This is the backend's source of truth for token validity.
+    The frontend should rely on this validation rather than checking expiration locally.
+    """
+    if not db:
+        return None
+    
+    try:
+        tokens_ref = db.collection("app_tokens").where("token", "==", token).limit(1).stream()
+        token_doc = next(tokens_ref, None)
+        if not token_doc:
+            logger.debug(f"App token not found in database")
+            return None
+        
+        token_data = token_doc.to_dict()
+        expires_at = token_data.get("expiresAt")
+        
+        # Check if token is expired (backend validates expiration)
+        if expires_at:
+            expires_dt = _parse_expires_at(expires_at)
+            if expires_dt is not None:
+                now = datetime.now(timezone.utc)
+                if now > expires_dt:
+                    logger.info(f"App token expired for user {token_data.get('user_id')} (expired at {expires_dt})")
+                    # Optionally delete the expired token
+                    try:
+                        token_doc.reference.delete()
+                    except Exception as e:
+                        logger.warning(f"Failed to delete expired token: {e}")
+                    return None
+            else:
+                logger.warning(f"Could not parse expiration for token, treating as invalid")
+                return None
+        
+        user_id = token_data.get("user_id")
+        email = token_data.get("email")
+        if not user_id:
+            logger.warning(f"App token missing user_id")
+            return None
+        
+        logger.debug(f"Authenticated user via app token: user_id={user_id}")
+        return AuthenticatedUser(user_id=user_id, email=email)
+    except Exception as e:
+        logger.error(f"Error verifying app token: {e}")
+        return None
+
+
 def verify_id_token_and_get_user(
     authorization: str = Header(None),
 ) -> AuthenticatedUser:
     """
-    Extracts the Bearer token, verifies it with Google,
-    and returns the google ID.
+    Extracts the Bearer token, verifies it (either Google ID token or app token),
+    and returns the authenticated user.
     """
 
     if not authorization or not authorization.startswith("Bearer "):
@@ -340,6 +415,12 @@ def verify_id_token_and_get_user(
 
     token = authorization.split(" ", 1)[1]
 
+    # First try to verify as app token
+    app_user = verify_app_token(token)
+    if app_user:
+        return app_user
+
+    # If not an app token, try Google ID token
     try:
         idinfo = google.oauth2.id_token.verify_oauth2_token(
             token,
@@ -529,15 +610,128 @@ def generate(
     check_usage(user.user_id, cost=est_cost, actual=False)
 
     # Call Gemini (real)
-    llm_result = llm_generate(contents, req.model)
-    input_tokens = llm_result.input_tokens or estimate_tokens_in
-    output_tokens = llm_result.output_tokens or estimate_tokens(llm_result.text)
+    text, function_calls = llm_generate(contents, req.model)
+    input_tokens = estimate_tokens_in  # We'd need to extract from response if available
+    output_tokens = estimate_tokens(text)
     actual_cost = calculate_cost(req.model, input_tokens, output_tokens)
 
     # Commit real cost
     check_usage(user.user_id, cost=actual_cost, actual=True)
 
-    return GenerateResponse(result=llm_result.text)
+    return GenerateResponse(result=text, function_calls=function_calls)
+
+
+def invalidate_user_tokens(user_id: str):
+    """
+    Invalidates all existing app tokens for a user by deleting them from Firestore.
+    This ensures only one active token exists per user at a time.
+    """
+    if not db:
+        return
+    
+    try:
+        tokens_ref = db.collection("app_tokens")
+        existing_tokens = tokens_ref.where("user_id", "==", user_id).stream()
+        
+        batch = db.batch()
+        count = 0
+        for token_doc in existing_tokens:
+            batch.delete(token_doc.reference)
+            count += 1
+        
+        if count > 0:
+            batch.commit()
+            logger.info(f"Invalidated {count} existing token(s) for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error invalidating tokens for user {user_id}: {e}")
+
+
+def cleanup_expired_tokens():
+    """
+    Removes expired tokens from Firestore to keep the collection clean.
+    This should be called periodically or on token verification.
+    """
+    if not db:
+        return
+    
+    try:
+        tokens_ref = db.collection("app_tokens")
+        all_tokens = tokens_ref.stream()
+        now = datetime.now(timezone.utc)
+        
+        batch = db.batch()
+        count = 0
+        for token_doc in all_tokens:
+            token_data = token_doc.to_dict()
+            expires_at = token_data.get("expiresAt")
+            
+            if expires_at:
+                expires_dt = None
+                if isinstance(expires_at, datetime):
+                    expires_dt = expires_at
+                elif hasattr(expires_at, 'timestamp'):
+                    expires_dt = datetime.fromtimestamp(expires_at.timestamp(), tz=timezone.utc)
+                
+                if expires_dt and now > expires_dt:
+                    batch.delete(token_doc.reference)
+                    count += 1
+        
+        if count > 0:
+            batch.commit()
+            logger.info(f"Cleaned up {count} expired token(s)")
+    except Exception as e:
+        logger.error(f"Error cleaning up expired tokens: {e}")
+
+
+@app.post("/api/auth/exchange")
+def exchange_token(
+    user: AuthenticatedUser = Depends(verify_id_token_and_get_user),
+):
+    """
+    Exchanges a Google ID token for a long-lived app token (valid for 1 month).
+    The Google ID token must be valid at the time of exchange.
+    
+    This endpoint:
+    - Invalidates any existing app tokens for the user
+    - Creates a new app token valid for 30 days
+    - Returns the token and its expiration time
+    """
+    if not db:
+        raise HTTPException(status_code=500, detail="Database unavailable")
+    
+    # Ensure user document exists
+    user_doc = get_or_create_user(user)
+    ensure_user_is_active(user_doc)
+    
+    # Invalidate any existing tokens for this user
+    invalidate_user_tokens(user.user_id)
+    
+    # Clean up expired tokens periodically (do this on exchange to avoid extra overhead)
+    cleanup_expired_tokens()
+    
+    # Generate a secure random token
+    app_token = secrets.token_urlsafe(32)
+    
+    # Calculate expiration (1 month from now)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=APP_TOKEN_VALIDITY_DAYS)
+    
+    # Store token in Firestore
+    tokens_ref = db.collection("app_tokens")
+    token_doc = {
+        "token": app_token,
+        "user_id": user.user_id,
+        "email": user.email,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "expiresAt": expires_at,
+    }
+    tokens_ref.add(token_doc)
+    
+    logger.info(f"Generated app token for user {user.user_id}, expires at {expires_at}")
+    
+    return {
+        "token": app_token,
+        "expiresAt": expires_at.isoformat(),
+    }
 
 
 @app.get("/api/auth/status")
