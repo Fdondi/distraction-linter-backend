@@ -38,6 +38,15 @@ class GenerateResponse(BaseModel):
     result: str | None = None  # None when response only contains function calls, no text
     function_calls: list[FunctionCall] = []
 
+class ModelInfo(BaseModel):
+    id: str
+    label: str
+    description: str
+
+class ModelsResponse(BaseModel):
+    models: list[ModelInfo]
+    default: str
+
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 _request_adapter = google.auth.transport.requests.Request()
@@ -48,6 +57,28 @@ logger = logging.getLogger(__name__)
 
 VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "europe-west1")
 AI_TIMEOUT_SECONDS = int(os.environ.get("AI_TIMEOUT_SECONDS", "30"))
+
+# Map logical model names to actual Vertex AI model identifiers.
+# "default" is what all clients send; override via DEFAULT_MODEL env var.
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "gemini-2.5-flash")
+MODEL_ALIASES = {
+    "default": DEFAULT_MODEL,
+}
+
+# Available models served to clients via /api/models.
+# Update this list when new models launch or old ones are deprecated.
+AVAILABLE_MODELS = [
+    {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash", "description": "Fast, capable, best value (recommended)"},
+    {"id": "gemini-2.5-flash-lite", "label": "Gemini 2.5 Flash Lite", "description": "Fastest, lowest cost"},
+    {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro", "description": "Most capable, thinking model, higher cost"},
+    {"id": "gemini-3.0-flash", "label": "Gemini 3.0 Flash", "description": "Fast, capable, best value (recommended)"},
+    {"id": "gemini-3.0-pro", "label": "Gemini 3.0 Pro", "description": "Most capable, thinking model, higher cost"},
+]
+
+
+def resolve_model(model: str) -> str:
+    """Resolve a logical model name to a Vertex AI model identifier."""
+    return MODEL_ALIASES.get(model, model)
 
 # Function declarations for function calling - defined as constants in the backend
 FUNCTION_DECLARATIONS = [
@@ -113,6 +144,12 @@ class AccessErrorCode:
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
+
+@app.get("/api/models", response_model=ModelsResponse)
+def list_models():
+    """Returns the list of available AI models. No auth required."""
+    return ModelsResponse(models=AVAILABLE_MODELS, default=DEFAULT_MODEL)
 
 if GOOGLE_CLIENT_ID:
     db = firestore.Client()
@@ -564,6 +601,7 @@ def _extract_function_calls(payload: dict) -> list[FunctionCall]:
     return function_calls
 
 def call_vertex_gemini(contents: list[dict], model: str, tools: list[dict] | None = None) -> tuple[str | None, list[FunctionCall], int | None, int | None]:
+    resolved = resolve_model(model)
     try:
         credentials, project_id = google.auth.default(
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
@@ -577,7 +615,7 @@ def call_vertex_gemini(contents: list[dict], model: str, tools: list[dict] | Non
         logger.error("Project ID missing for Vertex AI call")
         raise HTTPException(status_code=500, detail="AI configuration incomplete")
 
-    model_path = _build_model_path(model, project_id, VERTEX_LOCATION)
+    model_path = _build_model_path(resolved, project_id, VERTEX_LOCATION)
     url = f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1/{model_path}:generateContent"
 
     session = google.auth.transport.requests.AuthorizedSession(credentials)
@@ -589,9 +627,22 @@ def call_vertex_gemini(contents: list[dict], model: str, tools: list[dict] | Non
 
     if response.status_code >= 300:
         logger.error(
-            "Vertex AI call failed status=%s body=%s", response.status_code, response.text
+            "Vertex AI call failed model=%s status=%s body=%s",
+            resolved, response.status_code, response.text,
         )
-        raise HTTPException(status_code=502, detail="AI generation failed")
+        if response.status_code == 404:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "model_not_found",
+                    "message": f"Model '{resolved}' is not available on Vertex AI",
+                    "available_models": AVAILABLE_MODELS,
+                },
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI generation failed (upstream {response.status_code})",
+        )
 
     try:
         data = response.json()
