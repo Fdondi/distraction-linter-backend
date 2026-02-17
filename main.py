@@ -2,6 +2,7 @@ import os
 import logging
 from dataclasses import dataclass
 from collections.abc import Iterable
+from typing import NamedTuple
 from google.cloud import firestore
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -12,6 +13,13 @@ import google.auth
 import google.auth.transport.requests
 import google.oauth2.id_token
 
+class LLMResult(NamedTuple):
+    text: str | None
+    function_calls: list = []
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
 class GenerateRequest(BaseModel):
     # Model defaults to "default" so missing/empty payloads don't 422
     model: str = "default"
@@ -19,6 +27,8 @@ class GenerateRequest(BaseModel):
     prompt: str | None = None
     # Structured contents (list of Vertex-style messages: role + parts[{text}])
     contents: list[dict] = []
+    # Optional client-provided tool declarations; when absent the server defaults apply
+    tools: list[dict] | None = None
 
 class FunctionCall(BaseModel):
     name: str
@@ -553,7 +563,7 @@ def _extract_function_calls(payload: dict) -> list[FunctionCall]:
                     function_calls.append(FunctionCall(name=name, args=args))
     return function_calls
 
-def call_vertex_gemini(contents: list[dict], model: str) -> tuple[str | None, list[FunctionCall], int | None, int | None]:
+def call_vertex_gemini(contents: list[dict], model: str, tools: list[dict] | None = None) -> tuple[str | None, list[FunctionCall], int | None, int | None]:
     try:
         credentials, project_id = google.auth.default(
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
@@ -573,7 +583,7 @@ def call_vertex_gemini(contents: list[dict], model: str) -> tuple[str | None, li
     session = google.auth.transport.requests.AuthorizedSession(credentials)
     payload = {
         "contents": contents,
-        "tools": FUNCTION_DECLARATIONS  # Always include function declarations
+        "tools": tools or FUNCTION_DECLARATIONS
     }
     response = session.post(url, json=payload, timeout=AI_TIMEOUT_SECONDS)
 
@@ -593,7 +603,7 @@ def call_vertex_gemini(contents: list[dict], model: str) -> tuple[str | None, li
     usage_meta = data.get("usageMetadata") or {}
     input_tokens, output_tokens = _extract_usage_tokens(usage_meta)
 
-    return (text, function_calls, input_tokens, output_tokens)
+    return LLMResult(text, function_calls, input_tokens, output_tokens)
 
 
 # Default LLM generator can be overridden in tests
@@ -631,7 +641,7 @@ def generate(
     check_usage(user.user_id, cost=est_cost, actual=False)
 
     # Call Gemini (real)
-    text, function_calls, actual_input_tokens, actual_output_tokens = llm_generate(contents, req.model)
+    text, function_calls, actual_input_tokens, actual_output_tokens = llm_generate(contents, req.model, req.tools)
     
     # Always use actual token counts from API response when available, fallback to estimates only if API didn't provide them
     input_tokens = actual_input_tokens if actual_input_tokens is not None else estimate_tokens_in

@@ -294,16 +294,18 @@ class GenerateEndpointTests(unittest.TestCase):
         )
 
         class StubLLM:
-            def __init__(self, text="Server reply", input_tokens=1200, output_tokens=800):
+            def __init__(self, text="Server reply", function_calls=None, input_tokens=1200, output_tokens=800):
                 self.calls = []
                 self.text = text
+                self.function_calls = function_calls or []
                 self.input_tokens = input_tokens
                 self.output_tokens = output_tokens
 
-            def __call__(self, contents, model):
-                self.calls.append((contents, model))
+            def __call__(self, contents, model, tools=None):
+                self.calls.append((contents, model, tools))
                 return main.LLMResult(
                     text=self.text,
+                    function_calls=self.function_calls,
                     input_tokens=self.input_tokens,
                     output_tokens=self.output_tokens,
                 )
@@ -324,9 +326,10 @@ class GenerateEndpointTests(unittest.TestCase):
         )
         self.assertEqual(response.result, "Server reply")
         self.assertEqual(len(self.stub_llm.calls), 1)
-        contents, model = self.stub_llm.calls[0]
+        contents, model, tools = self.stub_llm.calls[0]
         self.assertEqual(contents, [{"role": "user", "parts": [{"text": "Hello world"}]}])
         self.assertEqual(model, "default")
+        self.assertIsNone(tools)
         self.assertAlmostEqual(
             self.usage_store[self.user_id]["usdUsed"], expected_cost
         )
@@ -336,10 +339,11 @@ class GenerateEndpointTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def __call__(self_inner, contents, model):
-                self_inner.calls.append((contents, model))
+            def __call__(self_inner, contents, model, tools=None):
+                self_inner.calls.append((contents, model, tools))
                 return self.main.LLMResult(
                     text="Short",
+                    function_calls=[],
                     input_tokens=None,
                     output_tokens=None,
                 )
@@ -374,10 +378,11 @@ class GenerateEndpointTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def __call__(self, contents, model):
-                self.calls.append((contents, model))
+            def __call__(self, contents, model, tools=None):
+                self.calls.append((contents, model, tools))
                 return main_module.LLMResult(
                     text="Done",
+                    function_calls=[],
                     input_tokens=10,
                     output_tokens=5,
                 )
@@ -395,9 +400,10 @@ class GenerateEndpointTests(unittest.TestCase):
 
         self.assertEqual(response.result, "Done")
         self.assertEqual(len(capturing_llm.calls), 1)
-        contents, model = capturing_llm.calls[0]
+        contents, model, tools = capturing_llm.calls[0]
         self.assertEqual(contents, provided_contents)
         self.assertEqual(model, "default")
+        self.assertIsNone(tools)
 
 
 class UserAdmissionTests(unittest.TestCase):
@@ -421,9 +427,9 @@ class UserAdmissionTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def __call__(self, contents, model):
-                self.calls.append((contents, model))
-                return self.main.LLMResult(text="ok", input_tokens=10, output_tokens=5)
+            def __call__(self, contents, model, tools=None):
+                self.calls.append((contents, model, tools))
+                return self.main.LLMResult(text="ok", function_calls=[], input_tokens=10, output_tokens=5)
 
         self.capturing_llm = CapturingLLM()
         self.main.llm_generate = self.capturing_llm
@@ -468,6 +474,173 @@ class UserAdmissionTests(unittest.TestCase):
             exc.detail.get("code"), self.main.AccessErrorCode.ACCESS_REFUSED
         )
         self.assertEqual(len(self.capturing_llm.calls), 0)
+
+class ToolsPassthroughTests(unittest.TestCase):
+    """Tests that client-provided tools are passed through to the LLM."""
+
+    def setUp(self):
+        self.now = datetime.now(timezone.utc)
+        self.user_id = "test-user"
+        self.users_store = {
+            self.user_id: {
+                "createdAt": self.now,
+                "updatedAt": self.now,
+                "status": "active",
+                "email": "tester@example.com",
+            }
+        }
+        self.subscriptions_store = {
+            self.user_id: {
+                "createdAt": self.now,
+                "updatedAt": self.now,
+            }
+        }
+        self.usage_store = {
+            self.user_id: {
+                "lastReset": self.now,
+                "usdUsed": 0.0,
+                "updatedAt": self.now,
+            }
+        }
+
+        import main
+
+        self.main = main
+        main.db = FullStubDB(
+            usage_store=self.usage_store,
+            users_store=self.users_store,
+            subscriptions_store=self.subscriptions_store,
+        )
+        self.user_ctx = main.AuthenticatedUser(
+            user_id=self.user_id, email="tester@example.com"
+        )
+
+        class CapturingLLM:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, contents, model, tools=None):
+                self.calls.append((contents, model, tools))
+                return main.LLMResult(
+                    text="Done",
+                    function_calls=[],
+                    input_tokens=10,
+                    output_tokens=5,
+                )
+
+        self.capturing_llm = CapturingLLM()
+        main.llm_generate = self.capturing_llm
+
+    def test_tools_none_when_not_provided(self):
+        req = self.main.GenerateRequest(prompt="hello", model="default")
+
+        self.main.generate(req, user=self.user_ctx)
+
+        _, _, tools = self.capturing_llm.calls[0]
+        self.assertIsNone(tools)
+
+    def test_client_tools_passed_through(self):
+        custom_tools = [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": "grantAccess",
+                        "description": "Open the app.",
+                    }
+                ]
+            }
+        ]
+        req = self.main.GenerateRequest(
+            prompt="open X",
+            model="default",
+            tools=custom_tools,
+        )
+
+        self.main.generate(req, user=self.user_ctx)
+
+        _, _, tools = self.capturing_llm.calls[0]
+        self.assertEqual(tools, custom_tools)
+
+    def test_client_tools_with_parameters(self):
+        custom_tools = [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": "launchApp",
+                        "description": "Launch an app.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "packageName": {
+                                    "type": "STRING",
+                                    "description": "Android package name",
+                                }
+                            },
+                            "required": ["packageName"],
+                        },
+                    }
+                ]
+            }
+        ]
+        req = self.main.GenerateRequest(
+            contents=[{"role": "user", "parts": [{"text": "open Instagram"}]}],
+            model="default",
+            tools=custom_tools,
+        )
+
+        self.main.generate(req, user=self.user_ctx)
+
+        contents, model, tools = self.capturing_llm.calls[0]
+        self.assertEqual(tools, custom_tools)
+        self.assertEqual(contents, [{"role": "user", "parts": [{"text": "open Instagram"}]}])
+
+    def test_function_calls_returned_in_response(self):
+        fc = self.main.FunctionCall(name="launchApp", args={"packageName": "com.twitter.android"})
+
+        class FunctionCallingLLM:
+            def __call__(self, contents, model, tools=None):
+                return self.main_ref.LLMResult(
+                    text="Opening X for you.",
+                    function_calls=[fc],
+                    input_tokens=10,
+                    output_tokens=5,
+                )
+
+        llm = FunctionCallingLLM()
+        llm.main_ref = self.main
+        self.main.llm_generate = llm
+
+        req = self.main.GenerateRequest(prompt="open X", model="default")
+        response = self.main.generate(req, user=self.user_ctx)
+
+        self.assertEqual(response.result, "Opening X for you.")
+        self.assertEqual(len(response.function_calls), 1)
+        self.assertEqual(response.function_calls[0].name, "launchApp")
+        self.assertEqual(response.function_calls[0].args["packageName"], "com.twitter.android")
+
+    def test_function_call_only_response_has_null_text(self):
+        fc = self.main.FunctionCall(name="grantAccess", args={})
+
+        class ToolOnlyLLM:
+            def __call__(self, contents, model, tools=None):
+                return self.main_ref.LLMResult(
+                    text=None,
+                    function_calls=[fc],
+                    input_tokens=10,
+                    output_tokens=5,
+                )
+
+        llm = ToolOnlyLLM()
+        llm.main_ref = self.main
+        self.main.llm_generate = llm
+
+        req = self.main.GenerateRequest(prompt="let me in", model="default")
+        response = self.main.generate(req, user=self.user_ctx)
+
+        self.assertIsNone(response.result)
+        self.assertEqual(len(response.function_calls), 1)
+        self.assertEqual(response.function_calls[0].name, "grantAccess")
+
 
 if __name__ == "__main__":
     unittest.main()
